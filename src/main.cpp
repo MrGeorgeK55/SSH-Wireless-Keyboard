@@ -22,7 +22,7 @@
 
 namespace {
 
-constexpr const char *kFirmwareVersion = "v1.0";
+constexpr const char *kFirmwareVersion = "v1.1";
 constexpr const char *kPreferencesNamespace = "sshwk";
 constexpr const char *kPortalSsid = "SSHWK";
 const IPAddress kPortalIp(10, 10, 10, 1);
@@ -425,7 +425,7 @@ static const LayoutKey kLatamLayout[] = {
   {'=', 0x27, 0x02, false},
   {'>', 0x64, 0x02, false},
   {'?', 0x2d, 0x02, false},
-  {'@', 0x1f, 0x40, false},
+  {'@', 0x14, 0x40, false},  // AltGr+Q on LATAM
   {'[', 0x34, 0x02, false},
   {'\\', 0x2d, 0x40, false},
   {']', 0x31, 0x02, false},

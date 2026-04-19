@@ -1,6 +1,4 @@
-# SSHWK
-
-`SSHWK` stands for `Secure SHell Wireless Keyboard`.
+# SSHWK - Secure SHell Wireless Keyboard
 
 This project targets the `ESP32-S3 SuperMini` and turns it into a Wi-Fi managed
 USB HID keyboard:
@@ -12,7 +10,7 @@ USB HID keyboard:
    a USB keyboard on the host computer connected to its USB-C port.
 5. Bytes received over SSH are translated into USB HID keyboard events.
 
-Current firmware version: `v0.8`
+Current firmware version: `v1.1`
 
 ## Features
 
@@ -36,6 +34,9 @@ Current firmware version: `v0.8`
   - external button on `GPIO1` to `GND`
   - hold for at least 5 seconds
   - LED blinks red before wiping config and rebooting
+ 
+> [!NOTE] 
+> Some keys as CTRL, SHIFT or ALT cant be sent via SSH and other keys like F11 could not be sent due to limitations of the SSH you are using (PuTTY for example)
 
 ## Board Notes
 
@@ -95,6 +96,8 @@ Inside the SSH session:
 
 - `Ctrl+A` toggles the keyboard layout between `US` and `ES-MX/LATAM`
 - `Ctrl+D` closes the SSH session
+
+(Setting configurable)
 
 ## Security Notes
 
