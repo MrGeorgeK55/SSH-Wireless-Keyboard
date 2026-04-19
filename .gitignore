@@ -1,0 +1,8 @@
+.pio/
+.pio-core/
+.venv/
+.claude/
+.codex
+CLAUDE.md
+__pycache__/
+*.pyc
