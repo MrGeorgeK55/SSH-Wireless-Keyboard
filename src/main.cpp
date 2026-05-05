@@ -22,7 +22,7 @@
 
 namespace {
 
-constexpr const char *kFirmwareVersion = "v1.1";
+constexpr const char *kFirmwareVersion = "v1.6";
 constexpr const char *kPreferencesNamespace = "sshwk";
 constexpr const char *kPortalSsid = "SSHWK";
 const IPAddress kPortalIp(10, 10, 10, 1);
@@ -34,8 +34,9 @@ constexpr uint32_t kWifiConnectTimeoutMs = 20000;
 constexpr uint32_t kProvisioningConnectTimeoutMs = 15000;
 constexpr uint32_t kReconnectIntervalMs = 10000;
 constexpr uint32_t kFactoryResetHoldMs = 5000;
+constexpr uint32_t kFactoryResetDebounceMs = 35;
 constexpr int32_t kLowSignalThresholdDbm = -70;
-constexpr uint8_t kFactoryResetPin = 1;
+constexpr uint8_t kFactoryResetPin = 0;
 constexpr size_t kSshBufferSize = 64;
 constexpr uint16_t kDnsPort = 53;
 constexpr int kMaxAuthAttempts = 5;
@@ -349,25 +350,52 @@ class StatusLed {
 StatusLed gStatusLed;
 
 bool pollFactoryReset(ConfigStore &store) {
-  static bool wasPressed = false;
+  static bool initialized = false;
+  static bool lastRawState = HIGH;
+  static bool stableState = HIGH;
+  static uint32_t lastChangeMs = 0;
   static uint32_t pressedAtMs = 0;
   static bool resetTriggered = false;
 
-  const bool pressed = digitalRead(kFactoryResetPin) == LOW;
+  const bool rawState = digitalRead(kFactoryResetPin);
   const uint32_t now = millis();
 
-  if (pressed && !wasPressed) {
-    wasPressed = true;
-    pressedAtMs = now;
-    resetTriggered = false;
-  } else if (!pressed) {
-    wasPressed = false;
-    resetTriggered = false;
+  if (!initialized) {
+    initialized = true;
+    lastRawState = rawState;
+    stableState = rawState;
+    lastChangeMs = now;
+    return false;
   }
 
-  if (pressed && !resetTriggered && now - pressedAtMs >= kFactoryResetHoldMs) {
+  if (rawState != lastRawState) {
+    lastRawState = rawState;
+    lastChangeMs = now;
+  }
+
+  if (now - lastChangeMs < kFactoryResetDebounceMs) {
+    return false;
+  }
+
+  if (rawState != stableState) {
+    stableState = rawState;
+    if (stableState == LOW) {
+      pressedAtMs = now;
+      resetTriggered = false;
+    } else {
+      pressedAtMs = 0;
+      resetTriggered = false;
+    }
+  }
+
+  if (stableState != LOW) {
+    resetTriggered = false;
+    return false;
+  }
+
+  if (!resetTriggered && pressedAtMs != 0 && now - pressedAtMs >= kFactoryResetHoldMs) {
     resetTriggered = true;
-    Serial.println("[RESET] Factory reset button held for 5 seconds. Clearing saved configuration.");
+    Serial.printf("[RESET] Factory reset pin GPIO%u held for 5 seconds. Clearing saved configuration.\n", kFactoryResetPin);
     gStatusLed.setMode(StatusLed::Mode::Resetting);
     for (int i = 0; i < 12; ++i) {
       gStatusLed.tick();
@@ -1046,9 +1074,7 @@ class ProvisioningPortal {
       return;
     }
 
-    serveForm("Testing Wi-Fi connection. This can take a few seconds...");
     gStatusLed.setMode(StatusLed::Mode::Connecting);
-    delay(200);
 
     if (!testWifi(wifiSsid, wifiPassword)) {
       gStatusLed.setMode(StatusLed::Mode::Provisioning);
@@ -1551,13 +1577,14 @@ bool connectToConfiguredWifi(const AppConfig &config) {
 }  // namespace
 
 void setup() {
+  pinMode(kFactoryResetPin, INPUT_PULLUP);
+
   // HID must be registered before the USB host finishes enumerating the device.
   // On ESP32-S3 native USB the host sees VBUS immediately after reset; any call
   // to Serial.begin() (which triggers USB.begin() internally) before this point
   // would lock the descriptor as CDC-only and Windows would never see a keyboard.
   gKeyboardSink.begin();
 
-  pinMode(kFactoryResetPin, INPUT_PULLUP);
   // With ARDUINO_USB_CDC_ON_BOOT=0, Serial maps to hardware UART0
   // (GPIO43 TX / GPIO44 RX) instead of USB CDC — USB is HID-only.
   Serial.begin(115200);
@@ -1565,6 +1592,8 @@ void setup() {
   Serial.println();
   Serial.println("SSHWK booting on ESP32-S3...");
   Serial.println("[HID] USB HID keyboard started.");
+  Serial.printf("[RESET] Factory reset button configured on GPIO%u, idle=%u\n",
+                kFactoryResetPin, digitalRead(kFactoryResetPin));
 
   gStatusLed.begin();
 

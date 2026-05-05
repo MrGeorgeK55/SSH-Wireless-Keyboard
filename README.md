@@ -10,7 +10,7 @@ USB HID keyboard:
    a USB keyboard on the host computer connected to its USB-C port.
 5. Bytes received over SSH are translated into USB HID keyboard events.
 
-Current firmware version: `v1.1`
+Current firmware version: `v1.6`
 
 ## Features
 
@@ -31,7 +31,7 @@ Current firmware version: `v1.1`
 - Readable terminal echo for special keys:
   - arrows, function keys, Home/End, Insert/Delete, Page Up/Page Down
 - Factory reset button:
-  - external button on `GPIO1` to `GND`
+  - board BOOT button on `GPIO0`
   - hold for at least 5 seconds
   - LED blinks red before wiping config and rebooting
  
@@ -179,11 +179,12 @@ If no valid config is stored, the board starts provisioning mode:
 
 The board validates Wi-Fi before saving, then reboots into normal mode.
 
-## Factory Reset Wiring
+## Factory Reset Button
 
-Wire a momentary pushbutton like this:
+Use the board BOOT button:
 
-- one side to `GPIO1`
-- one side to `GND`
+- `GPIO0`
+- hold for at least 5 seconds after the firmware has booted
 
-The firmware uses `INPUT_PULLUP`, so pressed = logic low.
+The firmware uses `INPUT_PULLUP`, debounce filtering, and pressed = logic low.
+This matches the BOOT button handling pattern used by the PocketGIF firmware.
