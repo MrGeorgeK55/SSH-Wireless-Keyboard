@@ -4,6 +4,7 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <mbedtls/sha256.h>
 #include <esp_random.h>
 
@@ -15,6 +16,7 @@
 #include <libssh/server.h>
 #include <libssh_esp32.h>
 
+#include <esp_netif.h>
 #include <sys/select.h>
 #include <netinet/in.h>
 #include "lwip/etharp.h"
@@ -22,7 +24,12 @@
 
 namespace {
 
-constexpr const char *kFirmwareVersion = "v1.6";
+constexpr const char *kFirmwareVersion = "v2.1";
+constexpr uint16_t kUsbFirmwareBcd = 0x0201;
+constexpr const char *kDefaultUsbManufacturer = "SSHWK Project";
+constexpr const char *kDefaultUsbProduct = "SSHWK Wireless Keyboard";
+constexpr const char *kDefaultUsbSerial = "SSHWK-S3-SUPERMINI";
+constexpr const char *kDefaultNetworkHostname = "sshwk";
 constexpr const char *kPreferencesNamespace = "sshwk";
 constexpr const char *kPortalSsid = "SSHWK";
 const IPAddress kPortalIp(10, 10, 10, 1);
@@ -55,8 +62,13 @@ struct AppConfig {
   String sshUsername;
   String sshPasswordHash;
   String sshPasswordSalt;
+  String usbManufacturer = kDefaultUsbManufacturer;
+  String usbProduct = kDefaultUsbProduct;
+  String usbSerial = kDefaultUsbSerial;
+  String networkHostname = kDefaultNetworkHostname;
+  bool terminalEcho = true;
   char ctrlLayoutKey = 'A';
-  char ctrlDiscKey = 'D';
+  char ctrlSettingsKey = 'T';
 
   bool isComplete() const {
     return !wifiSsid.isEmpty() && !sshUsername.isEmpty() &&
@@ -64,7 +76,7 @@ struct AppConfig {
   }
 
   uint8_t ctrlLayoutByte() const { return static_cast<uint8_t>(ctrlLayoutKey - 'A' + 1); }
-  uint8_t ctrlDiscByte() const { return static_cast<uint8_t>(ctrlDiscKey - 'A' + 1); }
+  uint8_t ctrlSettingsByte() const { return static_cast<uint8_t>(ctrlSettingsKey - 'A' + 1); }
 };
 
 class ConfigStore {
@@ -80,10 +92,15 @@ class ConfigStore {
     config.sshUsername = prefs.getString("ssh_user", "");
     config.sshPasswordHash = prefs.getString("ssh_hash", "");
     config.sshPasswordSalt = prefs.getString("ssh_salt", "");
+    config.usbManufacturer = prefs.getString("usb_mfg", kDefaultUsbManufacturer);
+    config.usbProduct = prefs.getString("usb_prod", kDefaultUsbProduct);
+    config.usbSerial = prefs.getString("usb_serial", kDefaultUsbSerial);
+    config.networkHostname = prefs.getString("net_host", kDefaultNetworkHostname);
+    config.terminalEcho = prefs.getBool("term_echo", true);
     const String ctrlLayout = prefs.getString("ctrl_layout", "A");
     config.ctrlLayoutKey = ctrlLayout.isEmpty() ? 'A' : static_cast<char>(toupper(ctrlLayout[0]));
-    const String ctrlDisc = prefs.getString("ctrl_disc", "D");
-    config.ctrlDiscKey = ctrlDisc.isEmpty() ? 'D' : static_cast<char>(toupper(ctrlDisc[0]));
+    const String ctrlSettings = prefs.getString("ctrl_settings", "T");
+    config.ctrlSettingsKey = ctrlSettings.isEmpty() ? 'T' : static_cast<char>(toupper(ctrlSettings[0]));
     prefs.end();
     return config.isComplete();
   }
@@ -100,9 +117,26 @@ class ConfigStore {
     const bool sshUserOk = prefs.putString("ssh_user", config.sshUsername) > 0;
     const bool sshHashOk = prefs.putString("ssh_hash", config.sshPasswordHash) > 0;
     const bool sshSaltOk = prefs.putString("ssh_salt", config.sshPasswordSalt) > 0;
+    const bool usbMfgOk = prefs.putString("usb_mfg", config.usbManufacturer) > 0;
+    const bool usbProdOk = prefs.putString("usb_prod", config.usbProduct) > 0;
+    const bool usbSerialOk = prefs.putString("usb_serial", config.usbSerial) > 0;
+    const bool netHostOk = prefs.putString("net_host", config.networkHostname) > 0;
+    const bool termEchoOk = prefs.putBool("term_echo", config.terminalEcho) > 0;
     const bool ctrlLayoutOk = prefs.putString("ctrl_layout", String(config.ctrlLayoutKey)) > 0;
-    const bool ctrlDiscOk = prefs.putString("ctrl_disc", String(config.ctrlDiscKey)) > 0;
-    const bool ok = wifiSsidOk && wifiPassOk && sshUserOk && sshHashOk && sshSaltOk && ctrlLayoutOk && ctrlDiscOk;
+    const bool ctrlSettingsOk = prefs.putString("ctrl_settings", String(config.ctrlSettingsKey)) > 0;
+    const bool ok = wifiSsidOk && wifiPassOk && sshUserOk && sshHashOk && sshSaltOk &&
+                    usbMfgOk && usbProdOk && usbSerialOk && netHostOk && termEchoOk &&
+                    ctrlLayoutOk && ctrlSettingsOk;
+    prefs.end();
+    return ok;
+  }
+
+  bool saveTerminalEcho(bool enabled) {
+    Preferences prefs;
+    if (!prefs.begin(kPreferencesNamespace, false)) {
+      return false;
+    }
+    const bool ok = prefs.putBool("term_echo", enabled) > 0;
     prefs.end();
     return ok;
   }
@@ -223,6 +257,71 @@ bool isValidSshUsername(const String &username) {
     }
   }
   return true;
+}
+
+bool isValidHostname(const String &hostname) {
+  if (hostname.isEmpty() || hostname.length() > 31) {
+    return false;
+  }
+  if (!isAlphaNumeric(static_cast<unsigned char>(hostname[0])) ||
+      !isAlphaNumeric(static_cast<unsigned char>(hostname[hostname.length() - 1]))) {
+    return false;
+  }
+  for (size_t i = 0; i < hostname.length(); ++i) {
+    const char c = hostname[i];
+    if (!isAlphaNumeric(static_cast<unsigned char>(c)) && c != '-') {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool isValidUsbIdentityString(const String &value, size_t maxLen) {
+  if (value.isEmpty() || value.length() > maxLen) {
+    return false;
+  }
+  for (size_t i = 0; i < value.length(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(value[i]);
+    if (c < 0x20 || c > 0x7e) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool setNetifHostname(const char *ifKey, const String &hostname) {
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey(ifKey);
+  if (netif == nullptr) {
+    Serial.printf("[NET] Interface %s is not ready for hostname assignment.\n", ifKey);
+    return false;
+  }
+  const esp_err_t err = esp_netif_set_hostname(netif, hostname.c_str());
+  if (err != ESP_OK) {
+    Serial.printf("[NET] Failed to set hostname '%s' on %s: %d\n", hostname.c_str(), ifKey, err);
+    return false;
+  }
+  const char *applied = nullptr;
+  if (esp_netif_get_hostname(netif, &applied) == ESP_OK && applied != nullptr) {
+    Serial.printf("[NET] Hostname on %s: %s\n", ifKey, applied);
+  }
+  return true;
+}
+
+String htmlEscape(const String &value) {
+  String escaped;
+  escaped.reserve(value.length());
+  for (size_t i = 0; i < value.length(); ++i) {
+    const char c = value[i];
+    switch (c) {
+      case '&': escaped += F("&amp;"); break;
+      case '<': escaped += F("&lt;"); break;
+      case '>': escaped += F("&gt;"); break;
+      case '"': escaped += F("&quot;"); break;
+      case '\'': escaped += F("&#39;"); break;
+      default: escaped += c; break;
+    }
+  }
+  return escaped;
 }
 
 class StatusLed {
@@ -481,7 +580,11 @@ class KeyboardSink {
     Latam,
   };
 
-  bool begin() {
+  bool begin(const AppConfig &config) {
+    USB.manufacturerName(config.usbManufacturer.c_str());
+    USB.productName(config.usbProduct.c_str());
+    USB.serialNumber(config.usbSerial.c_str());
+    USB.firmwareVersion(kUsbFirmwareBcd);
     keyboard_.begin();
     USB.begin();
     delay(250);
@@ -880,7 +983,8 @@ struct ScanCache {
 
 class ProvisioningPortal {
  public:
-  explicit ProvisioningPortal(ConfigStore &store) : store_(store), server_(kHttpPort) {}
+  ProvisioningPortal(ConfigStore &store, const AppConfig &config)
+      : store_(store), config_(config), server_(kHttpPort) {}
 
   [[noreturn]] void run() {
     startAccessPoint();
@@ -940,11 +1044,15 @@ class ProvisioningPortal {
 
   void startAccessPoint() {
     WiFi.persistent(false);
+    WiFi.setHostname(config_.networkHostname.c_str());
     WiFi.mode(WIFI_AP_STA);  // STA mode required for WiFi.scanNetworks() to work
+    setNetifHostname("WIFI_STA_DEF", config_.networkHostname);
     WiFi.softAPdisconnect(true);
     WiFi.disconnect(false);  // disconnect STA without disabling the STA interface
     delay(100);
     WiFi.softAPConfig(kPortalIp, kPortalGateway, kPortalSubnet);
+    WiFi.softAPsetHostname(config_.networkHostname.c_str());
+    setNetifHostname("WIFI_AP_DEF", config_.networkHostname);
     WiFi.softAP(kPortalSsid);
   }
 
@@ -1024,10 +1132,21 @@ class ProvisioningPortal {
     html += F("<label for='wifi_pass'>Wi-Fi Password</label><input id='wifi_pass' name='wifi_pass' type='password' maxlength='64'>");
     html += F("<label for='ssh_user'>SSH Username</label><input id='ssh_user' name='ssh_user' maxlength='32' required>");
     html += F("<label for='ssh_pass'>SSH Password</label><input id='ssh_pass' name='ssh_pass' type='password' minlength='8' maxlength='64' required>");
-    html += F("<label>Session Keys &mdash; leave blank for defaults (A and D)</label>");
+    html += F("<label for='net_host'>Network Hostname</label><input id='net_host' name='net_host' maxlength='31' required value='");
+    html += htmlEscape(config_.networkHostname);
+    html += F("'><div class='hint'>Letters, numbers, and hyphen only. Must start and end with a letter or number.</div>");
+    html += F("<label for='usb_product'>USB Product Name</label><input id='usb_product' name='usb_product' maxlength='63' required value='");
+    html += htmlEscape(config_.usbProduct);
+    html += F("'>");
+    html += F("<label for='usb_mfg'>USB Manufacturer</label><input id='usb_mfg' name='usb_mfg' maxlength='63' required value='");
+    html += htmlEscape(config_.usbManufacturer);
+    html += F("'>");
+    html += F("<label for='usb_serial'>USB Serial</label><input id='usb_serial' name='usb_serial' maxlength='63' required value='");
+    html += htmlEscape(config_.usbSerial);
+    html += F("'>");
+    html += F("<label>Session Keys &mdash; leave blank for defaults. Ctrl+T opens settings.</label>");
     html += F("<div class='ctrl-row'>");
     html += F("<div class='ctrl-item'><span>Layout toggle: Ctrl+</span><input id='ctrl_layout' name='ctrl_layout' maxlength='1' placeholder='A'></div>");
-    html += F("<div class='ctrl-item'><span>Disconnect: Ctrl+</span><input id='ctrl_disc' name='ctrl_disc' maxlength='1' placeholder='D'></div>");
     html += F("</div>");
     html += F("<button class='btn-primary' type='submit'>Save And Reboot</button></form>");
     html += F("<div class='hint'>AP SSID: <strong>SSHWK</strong>. AP IP: <strong>10.10.10.1</strong>. ");
@@ -1043,6 +1162,10 @@ class ProvisioningPortal {
     const String wifiPassword = server_.arg("wifi_pass");
     const String sshUser = server_.arg("ssh_user");
     const String sshPass = server_.arg("ssh_pass");
+    const String networkHostname = server_.arg("net_host");
+    const String usbProduct = server_.arg("usb_product");
+    const String usbManufacturer = server_.arg("usb_mfg");
+    const String usbSerial = server_.arg("usb_serial");
 
     if (wifiSsid.isEmpty()) {
       serveForm("Wi-Fi SSID is required.");
@@ -1056,27 +1179,37 @@ class ProvisioningPortal {
       serveForm("SSH password must be at least 8 characters.");
       return;
     }
+    if (!isValidHostname(networkHostname)) {
+      serveForm("Network hostname must be 1-31 chars, use only letters/numbers/hyphen, and start/end with a letter or number.");
+      return;
+    }
+    if (!isValidUsbIdentityString(usbProduct, 63)) {
+      serveForm("USB product name must be 1-63 printable ASCII characters.");
+      return;
+    }
+    if (!isValidUsbIdentityString(usbManufacturer, 63)) {
+      serveForm("USB manufacturer must be 1-63 printable ASCII characters.");
+      return;
+    }
+    if (!isValidUsbIdentityString(usbSerial, 63)) {
+      serveForm("USB serial must be 1-63 printable ASCII characters.");
+      return;
+    }
 
     const String ctrlLayoutArg = server_.arg("ctrl_layout");
-    const String ctrlDiscArg = server_.arg("ctrl_disc");
     char ctrlLayoutKey = 'A';
-    char ctrlDiscKey = 'D';
     if (!ctrlLayoutArg.isEmpty()) {
       const char c = static_cast<char>(toupper(static_cast<unsigned char>(ctrlLayoutArg[0])));
       if (c >= 'A' && c <= 'Z') ctrlLayoutKey = c;
     }
-    if (!ctrlDiscArg.isEmpty()) {
-      const char c = static_cast<char>(toupper(static_cast<unsigned char>(ctrlDiscArg[0])));
-      if (c >= 'A' && c <= 'Z') ctrlDiscKey = c;
-    }
-    if (ctrlLayoutKey == ctrlDiscKey) {
-      serveForm("Layout toggle and disconnect keys must be different.");
+    if (ctrlLayoutKey == config_.ctrlSettingsKey) {
+      serveForm("Layout toggle and settings keys must be different. Ctrl+T is reserved for settings.");
       return;
     }
 
     gStatusLed.setMode(StatusLed::Mode::Connecting);
 
-    if (!testWifi(wifiSsid, wifiPassword)) {
+    if (!testWifi(wifiSsid, wifiPassword, networkHostname)) {
       gStatusLed.setMode(StatusLed::Mode::Provisioning);
       serveForm("Wi-Fi connection failed. Check the SSID or password and try again.");
       return;
@@ -1089,8 +1222,13 @@ class ProvisioningPortal {
     config.sshUsername = sshUser;
     config.sshPasswordSalt = salt;
     config.sshPasswordHash = sha256HexSalted(sshPass, salt);
+    config.networkHostname = networkHostname;
+    config.usbProduct = usbProduct;
+    config.usbManufacturer = usbManufacturer;
+    config.usbSerial = usbSerial;
+    config.terminalEcho = config_.terminalEcho;
     config.ctrlLayoutKey = ctrlLayoutKey;
-    config.ctrlDiscKey = ctrlDiscKey;
+    config.ctrlSettingsKey = config_.ctrlSettingsKey;
 
     if (!store_.save(config)) {
       gStatusLed.setMode(StatusLed::Mode::Error);
@@ -1138,8 +1276,10 @@ class ProvisioningPortal {
     server_.send(200, "application/json", json);
   }
 
-  bool testWifi(const String &ssid, const String &password) {
+  bool testWifi(const String &ssid, const String &password, const String &hostname) {
+    WiFi.setHostname(hostname.c_str());
     WiFi.mode(WIFI_AP_STA);
+    setNetifHostname("WIFI_STA_DEF", hostname);
     WiFi.begin(ssid.c_str(), password.c_str());
     const uint32_t start = millis();
 
@@ -1165,6 +1305,7 @@ class ProvisioningPortal {
   }
 
   ConfigStore &store_;
+  AppConfig config_;
   WebServer server_;
   DNSServer dnsServer_;
   ScanCache scanCache_;
@@ -1226,6 +1367,8 @@ class SshKeyboardServer {
           lastReconnectAttemptMs = millis();
           Serial.println("[WIFI] Reconnecting...");
           WiFi.disconnect();
+          WiFi.setHostname(config_.networkHostname.c_str());
+          setNetifHostname("WIFI_STA_DEF", config_.networkHostname);
           WiFi.begin(config_.wifiSsid.c_str(), config_.wifiPassword.c_str());
         }
         gStatusLed.tick();
@@ -1407,6 +1550,9 @@ class SshKeyboardServer {
     banner += "\r\n";
     banner += "SSHWK ready on ";
     banner += WiFi.localIP().toString();
+    banner += " (";
+    banner += config_.networkHostname;
+    banner += ".local)";
     banner += "\r\n";
     banner += "Every byte from this SSH session is translated to USB HID keyboard events.\r\n";
     banner += "RGB LED: white=portal, blue=connected, yellow=weak Wi-Fi.\r\n";
@@ -1414,13 +1560,91 @@ class SshKeyboardServer {
     banner += sink_.layoutName();
     banner += "\r\n";
     banner += sink_.statusText();
+    banner += "Terminal echo: ";
+    banner += config_.terminalEcho ? "ON" : "OFF";
+    banner += "\r\n";
     banner += "Press Ctrl+";
     banner += config_.ctrlLayoutKey;
     banner += " to toggle keyboard layout (US / ES-MX-LATAM).\r\n";
     banner += "Press Ctrl+";
-    banner += config_.ctrlDiscKey;
-    banner += " to close the session.\r\n\r\n";
+    banner += config_.ctrlSettingsKey;
+    banner += " to open settings menu.\r\n";
+    banner += "Use the settings menu to close the session.\r\n\r\n";
     ssh_channel_write(channel, banner.c_str(), banner.length());
+  }
+
+  void writeChannel(ssh_channel channel, const char *text) {
+    ssh_channel_write(channel, text, strlen(text));
+  }
+
+  void writeEchoStatus(ssh_channel channel) {
+    writeChannel(channel, config_.terminalEcho ? "\r\n[settings] terminal echo is ON\r\n"
+                                               : "\r\n[settings] terminal echo is OFF\r\n");
+  }
+
+  void showSettingsMenu(ssh_channel channel) {
+    String menu;
+    menu += "\r\n";
+    menu += "SSHWK settings\r\n";
+    menu += "--------------\r\n";
+    menu += "e - toggle terminal echo (currently ";
+    menu += config_.terminalEcho ? "ON" : "OFF";
+    menu += ")\r\n";
+    menu += "s - show status\r\n";
+    menu += "x - close SSH session\r\n";
+    menu += "q - close settings\r\n";
+    menu += "\r\n";
+    menu += "Echo OFF hides typed characters in this SSH window, but HID output still works.\r\n";
+    menu += "> ";
+    ssh_channel_write(channel, menu.c_str(), menu.length());
+  }
+
+  bool handleSettingsMenu(ssh_channel channel) {
+    showSettingsMenu(channel);
+    while (ssh_channel_is_open(channel) && !ssh_channel_is_eof(channel)) {
+      gStatusLed.tick();
+      pollFactoryReset(store_);
+
+      const int available = ssh_channel_poll(channel, 0);
+      if (available == SSH_ERROR) {
+        return false;
+      }
+      if (available <= 0) {
+        delay(10);
+        continue;
+      }
+
+      uint8_t byte = 0;
+      const int readBytes = ssh_channel_read_nonblocking(channel, &byte, 1, 0);
+      if (readBytes <= 0) {
+        delay(10);
+        continue;
+      }
+
+      const char c = static_cast<char>(tolower(byte));
+      if (c == 'e') {
+        config_.terminalEcho = !config_.terminalEcho;
+        const bool saved = store_.saveTerminalEcho(config_.terminalEcho);
+        writeEchoStatus(channel);
+        writeChannel(channel, saved ? "[settings] saved\r\n> " : "[settings] failed to save\r\n> ");
+      } else if (c == 's') {
+        writeChannel(channel, "\r\n[settings] layout: ");
+        writeChannel(channel, sink_.layoutName());
+        writeEchoStatus(channel);
+        writeChannel(channel, "> ");
+      } else if (c == 'x') {
+        writeChannel(channel, "\r\n[settings] closing SSH session\r\n");
+        return true;
+      } else if (c == 'q' || byte == 0x1B || byte == config_.ctrlSettingsByte()) {
+        writeChannel(channel, "\r\n[settings] closed\r\n");
+        return false;
+      } else if (byte == '\r' || byte == '\n') {
+        writeChannel(channel, "\r\n> ");
+      } else {
+        writeChannel(channel, "\r\n[settings] unknown option. Use e, s, x, or q.\r\n> ");
+      }
+    }
+    return false;
   }
 
   void pumpChannel(ssh_channel channel) {
@@ -1453,6 +1677,12 @@ class SshKeyboardServer {
 
       for (int i = 0; i < readBytes; ++i) {
         const uint8_t byte = buffer[i];
+        if (byte == config_.ctrlSettingsByte()) {
+          if (handleSettingsMenu(channel)) {
+            return;
+          }
+          continue;
+        }
         if (byte == config_.ctrlLayoutByte()) {
           const char *layoutMsgPrefix = "\r\n[layout] switched to ";
           const char *layoutMsgSuffix = "\r\n";
@@ -1462,13 +1692,11 @@ class SshKeyboardServer {
           ssh_channel_write(channel, layoutMsgSuffix, strlen(layoutMsgSuffix));
           continue;
         }
-        if (byte == config_.ctrlDiscByte()) {
-          return;
-        }
-
         sink_.sendByte(byte);
         if (const char *label = sink_.takeEchoLabel()) {
-          ssh_channel_write(channel, label, strlen(label));
+          if (config_.terminalEcho) {
+            ssh_channel_write(channel, label, strlen(label));
+          }
           continue;
         }
         if (sink_.ansiSequencePending()) {
@@ -1479,6 +1707,9 @@ class SshKeyboardServer {
         // Escape sequences (arrows, F-keys, …) must NOT be echoed raw because
         // the SSH client's terminal emulator would act on them (e.g. move the
         // cursor) instead of just showing them.
+        if (!config_.terminalEcho) {
+          continue;
+        }
         if (byte >= 0x20 && byte < 0x7F) {
           ssh_channel_write(channel, &byte, 1);
         } else if (byte == '\r') {
@@ -1539,7 +1770,7 @@ class SshKeyboardServer {
     }
   }
 
-  const AppConfig &config_;
+  AppConfig config_;
   KeyboardSink &sink_;
   ConfigStore &store_;
   ssh_bind bind_ = nullptr;
@@ -1550,7 +1781,9 @@ class SshKeyboardServer {
 bool connectToConfiguredWifi(const AppConfig &config) {
   WiFi.persistent(false);
   WiFi.setSleep(false);
+  WiFi.setHostname(config.networkHostname.c_str());
   WiFi.mode(WIFI_STA);
+  setNetifHostname("WIFI_STA_DEF", config.networkHostname);
   WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
 
   Serial.printf("[WIFI] Connecting to '%s'\n", config.wifiSsid.c_str());
@@ -1569,6 +1802,14 @@ bool connectToConfiguredWifi(const AppConfig &config) {
   }
 
   Serial.printf("[WIFI] Connected. DHCP IP: %s RSSI: %d dBm\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  if (MDNS.begin(config.networkHostname.c_str())) {
+    MDNS.addService("ssh", "tcp", kSshPort);
+    MDNS.addServiceTxt("ssh", "tcp", "fw", kFirmwareVersion);
+    MDNS.addServiceTxt("ssh", "tcp", "product", config.usbProduct.c_str());
+    Serial.printf("[MDNS] Hostname active: %s.local\n", config.networkHostname.c_str());
+  } else {
+    Serial.println("[MDNS] Failed to start mDNS responder.");
+  }
   gStatusLed.setMode(WiFi.RSSI() <= kLowSignalThresholdDbm ? StatusLed::Mode::ConnectedWeak
                                                            : StatusLed::Mode::ConnectedGood);
   return true;
@@ -1579,11 +1820,15 @@ bool connectToConfiguredWifi(const AppConfig &config) {
 void setup() {
   pinMode(kFactoryResetPin, INPUT_PULLUP);
 
+  AppConfig config;
+  ConfigStore store;
+  const bool configComplete = store.load(config);
+
   // HID must be registered before the USB host finishes enumerating the device.
   // On ESP32-S3 native USB the host sees VBUS immediately after reset; any call
   // to Serial.begin() (which triggers USB.begin() internally) before this point
   // would lock the descriptor as CDC-only and Windows would never see a keyboard.
-  gKeyboardSink.begin();
+  gKeyboardSink.begin(config);
 
   // With ARDUINO_USB_CDC_ON_BOOT=0, Serial maps to hardware UART0
   // (GPIO43 TX / GPIO44 RX) instead of USB CDC — USB is HID-only.
@@ -1592,19 +1837,20 @@ void setup() {
   Serial.println();
   Serial.println("SSHWK booting on ESP32-S3...");
   Serial.println("[HID] USB HID keyboard started.");
+  Serial.printf("[USB] Manufacturer='%s' Product='%s' Serial='%s'\n",
+                config.usbManufacturer.c_str(), config.usbProduct.c_str(), config.usbSerial.c_str());
+  Serial.printf("[NET] Hostname='%s'\n", config.networkHostname.c_str());
   Serial.printf("[RESET] Factory reset button configured on GPIO%u, idle=%u\n",
                 kFactoryResetPin, digitalRead(kFactoryResetPin));
 
   gStatusLed.begin();
 
-  AppConfig config;
-  ConfigStore store;
   WiFi.persistent(false);
   WiFi.setSleep(false);
 
-  if (!store.load(config)) {
+  if (!configComplete) {
     Serial.println("[BOOT] No saved configuration. Entering provisioning mode.");
-    ProvisioningPortal portal(store);
+    ProvisioningPortal portal(store, config);
     portal.run();
   }
 
@@ -1612,7 +1858,7 @@ void setup() {
     Serial.println("[BOOT] Saved Wi-Fi credentials failed. Clearing configuration and returning to portal.");
     store.clear();
     delay(250);
-    ProvisioningPortal portal(store);
+    ProvisioningPortal portal(store, config);
     portal.run();
   }
 

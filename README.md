@@ -10,7 +10,7 @@ USB HID keyboard:
    a USB keyboard on the host computer connected to its USB-C port.
 5. Bytes received over SSH are translated into USB HID keyboard events.
 
-Current firmware version: `v1.6`
+Current firmware version: `v2.1`
 
 ## Features
 
@@ -23,11 +23,21 @@ Current firmware version: `v1.6`
   - stable SSH host key persisted in NVS
   - live SSH MOTD with firmware version and active layout
 - USB HID keyboard output over the board's native USB-C port
+- Custom device identity:
+  - configurable USB manufacturer
+  - configurable USB product/name
+  - configurable USB serial
+  - configurable DHCP/mDNS hostname
 - Runtime layout toggle:
   - default layout: `US`
   - alternate layout: `ES-MX/LATAM`
   - toggle with `Ctrl+A` inside the SSH session
-- Session exit with `Ctrl+D`
+- Terminal settings menu with `Ctrl+T`
+  - terminal echo toggle
+  - SSH session close
+- Persistent terminal echo setting:
+  - default: echo on
+  - echo off hides typed characters in the SSH terminal while still sending HID keystrokes
 - Readable terminal echo for special keys:
   - arrows, function keys, Home/End, Insert/Delete, Page Up/Page Down
 - Factory reset button:
@@ -95,9 +105,15 @@ Handled input includes:
 Inside the SSH session:
 
 - `Ctrl+A` toggles the keyboard layout between `US` and `ES-MX/LATAM`
-- `Ctrl+D` closes the SSH session
+- `Ctrl+T` opens the terminal settings menu
 
-(Setting configurable)
+The settings menu currently supports persistent terminal echo on/off. This is
+useful when typing passwords because PuTTY will not keep the typed characters on
+screen while echo is off. It also contains the SSH session close option. The
+echo setting is stored in NVS and persists until factory reset.
+
+The layout control key is configurable in the setup portal. Session close is
+menu-only to reduce accidental disconnects.
 
 ## Security Notes
 
@@ -122,8 +138,25 @@ This project uses:
 
 - `LibSSH-ESP32`
 - Arduino `USBHIDKeyboard`
+- Arduino `ESPmDNS`
 - Arduino `DNSServer`
 - Arduino `WebServer`
+
+## Device Identity
+
+The default firmware identity is defined near the top of `src/main.cpp`.
+
+- `kDefaultUsbManufacturer`: USB manufacturer string
+- `kDefaultUsbProduct`: USB HID product/name string
+- `kDefaultUsbSerial`: USB serial string
+- `kDefaultNetworkHostname`: DHCP hostname and mDNS hostname
+
+By default, the device appears on USB as `SSHWK Wireless Keyboard` from
+`SSHWK Project`. On the network it asks DHCP for hostname `sshwk` and advertises
+SSH via mDNS as `sshwk.local`.
+
+These values are configurable in the setup portal. Save changes and reboot for
+USB descriptor changes to take effect.
 
 ## Flashing
 
